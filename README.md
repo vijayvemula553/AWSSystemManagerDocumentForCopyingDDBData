@@ -1,75 +1,91 @@
-DynamoDB Record Cloner via Lambda + SSM
-Overview
+# DynamoDB Record Cloner via Lambda + SSM
 
-CloudFormation template to clone DynamoDB records using:
+## Overview
 
-Lambda (CloneDynamoDBRecords)
+Clone DynamoDB records from one table to another using:
 
-IAM role for Lambda
-
-SSM Automation Document (Clone-DynamoDB-Records)
+- Lambda (`CloneDynamoDBRecords`)  
+- IAM role for Lambda  
+- SSM Automation Document (`Clone-DynamoDB-Records`)  
 
 Supports filtering by:
 
-Timestamps (DateField + AfterTimestamp / BeforeTimestamp)
+- ISO/epoch timestamps (`DateField`, `AfterTimestamp`, `BeforeTimestamp`)  
+- Primary keys (`PrimaryKeys`)  
+- Attribute filters (`AttributeFilters`)  
 
-Primary keys (PrimaryKeys)
+---
 
-Attribute filters (AttributeFilters)
+## Features
 
-Deployment
+- Fully deployable via CloudFormation  
+- SSM Automation Document automatically references the Lambda ARN  
+- Flexible filtering options: date, primary keys, and attributes  
+- Supports large table scans with batching  
+
+---
+
+## Deployment Steps
+
+### Step 1: Deploy CloudFormation Stack
+
+```bash
 aws cloudformation deploy \
   --template-file clone-dynamodb-stack.yaml \
   --stack-name CloneDynamoDBStack \
   --capabilities CAPABILITY_NAMED_IAM
+```
 
+### Step 2: Resources Created
+After deploying the CloudFormation stack, the following resources will be created:
 
-Then execute the SSM document via AWS Systems Manager → Automation → Clone-DynamoDB-Records.
+- **Lambda function:** `CloneDynamoDBRecords`  
+- **IAM Role for Lambda:** `CloneDynamoDBRecords-ExecutionRole`  
+- **SSM Automation Document:** `Clone-DynamoDB-Records`  
+- **IAM Role for SSM:** `CloneDynamoDB-SSMRole` (optional cross-account)
 
-SSM Parameters
-Parameter	Type	Description
-SourceTable	String	DynamoDB table to copy from
-TargetTable	String	DynamoDB table to copy to
-DateField	String	Optional timestamp field
-AfterTimestamp	String	Optional ISO/epoch timestamp (after)
-BeforeTimestamp	String	Optional ISO/epoch timestamp (before)
-PrimaryKeys	String	Optional JSON array of primary keys
-AttributeFilters	String	Optional JSON key/value filters
-Examples
+###  Step3: SSM Automation Document Parameters
 
-Copy all after timestamp
+| Parameter          | Type   | Description |
+|------------------ |--------|-------------|
+| `SourceTable`      | String | DynamoDB table to copy from |
+| `TargetTable`      | String | DynamoDB table to copy to |
+| `DateField`        | String | Optional timestamp field |
+| `AfterTimestamp`   | String | Optional ISO/epoch timestamp (after) |
+| `BeforeTimestamp`  | String | Optional ISO/epoch timestamp (before) |
+| `PrimaryKeys`      | String | Optional JSON array of primary keys |
+| `AttributeFilters` | String | Optional JSON key/value filters |
 
-{
+> Pass `PrimaryKeys` and `AttributeFilters` as **stringified JSON**.
+
+### Examples for lambda input
+1. Copy all records after a timestamp
+  ``` {
   "SourceTable": "Orders",
   "TargetTable": "OrdersBackup",
   "DateField": "updatedAt",
   "AfterTimestamp": "2025-01-01T00:00:00Z"
 }
+```
 
-
-Copy by attributes
-
-{
+2. Copy records matching attributes
+```{
   "SourceTable": "Orders",
   "TargetTable": "OrdersBackup",
+  "DateField": "updatedAt",
+  "AfterTimestamp": "2025-01-01T00:00:00Z",
   "AttributeFilters": "{\"status\":\"DELIVERED\",\"region\":\"US\"}"
 }
+```
 
-
-Copy by primary keys
-
-{
+3. Copy specific primary keys
+   ```
+   {
   "SourceTable": "Orders",
   "TargetTable": "OrdersBackup",
   "PrimaryKeys": "[{\"orderId\":\"12345\"},{\"orderId\":\"67890\"}]"
 }
+```
 
-Notes
 
-Supports ISO or epoch timestamps
 
-Batch writing via batch_writer()
-
-Empty filters copy all items (optionally filtered by date)
-
-Cross-account execution possible via CloneDynamoDB-SSMRole
