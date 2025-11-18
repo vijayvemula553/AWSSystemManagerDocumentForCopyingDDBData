@@ -1,0 +1,229 @@
+AWSTemplateFormatVersion: '2010-09-09'
+Description: >
+  Complete setup to clone DynamoDB records via Lambda and SSM Automation Document.
+  Includes Lambda function, execution roles, and SSM doc.
+
+Parameters:
+  LambdaFunctionName:
+    Type: String
+    Default: CloneDynamoDBRecords
+    Description: Name of the Lambda function
+  LambdaRuntime:
+    Type: String
+    Default: python3.10
+  LambdaTimeout:
+    Type: Number
+    Default: 900
+    Description: Lambda timeout in seconds
+  LambdaMemory:
+    Type: Number
+    Default: 512
+    Description: Lambda memory in MB
+
+Resources:
+
+  # ----------------------------
+  # IAM Role for Lambda
+  # ----------------------------
+  LambdaExecutionRole:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: !Sub "${LambdaFunctionName}-ExecutionRole"
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: lambda.amazonaws.com
+            Action: sts:AssumeRole
+      ManagedPolicyArns:
+        - arn:aws:iam::aws:policy/service-role/AWSLambdaBasicExecutionRole
+      Policies:
+        - PolicyName: DynamoDBAccessPolicy
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action:
+                  - dynamodb:GetItem
+                  - dynamodb:Scan
+                  - dynamodb:PutItem
+                  - dynamodb:BatchWriteItem
+                Resource: "*"
+
+  # ----------------------------
+  # Lambda Function
+  # ----------------------------
+  CloneDynamoDBLambda:
+    Type: AWS::Lambda::Function
+    Properties:
+      FunctionName: !Ref LambdaFunctionName
+      Runtime: !Ref LambdaRuntime
+      Handler: index.lambda_handler
+      Role: !GetAtt LambdaExecutionRole.Arn
+      Timeout: !Ref LambdaTimeout
+      MemorySize: !Ref LambdaMemory
+      Code:
+        ZipFile: |
+          import boto3
+          from boto3.dynamodb.conditions import Attr
+          from datetime import datetime
+          import json
+
+          dynamodb = boto3.resource("dynamodb")
+
+          def is_epoch(value):
+              if value is None:
+                  return False
+              try:
+                  v = int(value)
+                  return 1000000000 <= v <= 9999999999999
+              except:
+                  return False
+
+          def normalize_timestamp(value):
+              if value is None or value == "":
+                  return None
+              if is_epoch(value):
+                  return int(value)
+              try:
+                  return datetime.fromisoformat(value.replace("Z","+00:00"))
+              except:
+                  raise ValueError(f"Invalid timestamp format: {value}")
+
+          def clone_records(source_table_name, target_table_name, date_field=None,
+                            after_ts=None, before_ts=None, primary_keys=None,
+                            attribute_filters=None):
+              source = dynamodb.Table(source_table_name)
+              target = dynamodb.Table(target_table_name)
+              filter_expr = None
+              after_norm = normalize_timestamp(after_ts)
+              before_norm = normalize_timestamp(before_ts)
+
+              if date_field:
+                  if after_norm is not None:
+                      fe = Attr(date_field).gte(after_norm)
+                      filter_expr = fe if filter_expr is None else filter_expr & fe
+                  if before_norm is not None:
+                      fe = Attr(date_field).lte(before_norm)
+                      filter_expr = fe if filter_expr is None else filter_expr & fe
+
+              if attribute_filters:
+                  for k,v in attribute_filters.items():
+                      fe = Attr(k).eq(v)
+                      filter_expr = fe if filter_expr is None else filter_expr & fe
+
+              items_to_clone = []
+
+              if primary_keys:
+                  for key_def in primary_keys:
+                      resp = source.get_item(Key=key_def)
+                      if "Item" in resp:
+                          items_to_clone.append(resp["Item"])
+              else:
+                  scan_kwargs = {}
+                  if filter_expr:
+                      scan_kwargs["FilterExpression"] = filter_expr
+                  last_key = None
+                  while True:
+                      if last_key:
+                          scan_kwargs["ExclusiveStartKey"] = last_key
+                      resp = source.scan(**scan_kwargs)
+                      items_to_clone.extend(resp.get("Items", []))
+                      last_key = resp.get("LastEvaluatedKey")
+                      if not last_key:
+                          break
+
+              with target.batch_writer() as batch:
+                  for item in items_to_clone:
+                      batch.put_item(Item=item)
+
+              return {
+                  "clonedCount": len(items_to_clone),
+                  "sourceTable": source_table_name,
+                  "targetTable": target_table_name
+              }
+
+          def lambda_handler(event, context):
+              response = clone_records(
+                  source_table_name=event["sourceTable"],
+                  target_table_name=event["targetTable"],
+                  date_field=event.get("dateField"),
+                  after_ts=event.get("afterTs"),
+                  before_ts=event.get("beforeTs"),
+                  primary_keys=event.get("primaryKeys"),
+                  attribute_filters=event.get("attributeFilters"),
+              )
+              return response
+
+  # ----------------------------
+  # IAM Role for SSM Automation (cross-account optional)
+  # ----------------------------
+  SSMAutomationRole:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: CloneDynamoDB-SSMRole
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service:
+                - ssm.amazonaws.com
+            Action: sts:AssumeRole
+      Policies:
+        - PolicyName: InvokeLambdaPolicy
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action: lambda:InvokeFunction
+                Resource: !GetAtt CloneDynamoDBLambda.Arn
+
+  # ----------------------------
+  # SSM Automation Document
+  # ----------------------------
+  CloneDynamoDBSSMDoc:
+    Type: AWS::SSM::Document
+    Properties:
+      DocumentType: Automation
+      Name: Clone-DynamoDB-Records
+      Content:
+        schemaVersion: '0.3'
+        description: "Automation document to clone DynamoDB records via Lambda"
+        parameters:
+          SourceTable:
+            type: String
+          TargetTable:
+            type: String
+          DateField:
+            type: String
+            default: ""
+          AfterTimestamp:
+            type: String
+            default: ""
+          BeforeTimestamp:
+            type: String
+            default: ""
+          PrimaryKeys:
+            type: String
+            default: ""
+          AttributeFilters:
+            type: String
+            default: ""
+        mainSteps:
+          - name: InvokeLambda
+            action: aws:invokeLambdaFunction
+            inputs:
+              FunctionName: !GetAtt CloneDynamoDBLambda.Arn
+              InvocationType: RequestResponse
+              Payload: |
+                {
+                  "sourceTable": "{{ SourceTable }}",
+                  "targetTable": "{{ TargetTable }}",
+                  "dateField": "{{ DateField }}",
+                  "afterTs": "{{ AfterTimestamp }}",
+                  "beforeTs": "{{ BeforeTimestamp }}",
+                  "primaryKeys": {{ PrimaryKeys | default("null") }},
+                  "attributeFilters": {{ AttributeFilters | default("null") }}
+                }
